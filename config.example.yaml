@@ -1,0 +1,68 @@
+# Copy to config.yaml and adjust model names/paths for the local machine.
+# This file deliberately keeps model names configurable; no model is baked
+# into the Python pipeline.
+runtime:
+  platform: macos
+  workspace: ~/.bookflow
+  ollama_url: http://127.0.0.1:11434
+
+models:
+  # Recommended by the local Frankenstein Chapter 1 evaluation.
+  translation: qwen3.5:latest
+  review: qwen3.5:latest
+
+processing:
+  target_language: zh-CN
+  output_mode: bilingual
+
+pdf:
+  engine: marker
+  marker_command: .venv/bin/marker_single
+  ocr_mode: auto
+  # 可选：只处理指定页码范围，例如 "0-7"；留空则处理整本 PDF。
+  page_range: null
+
+calibre:
+  command: ebook-convert
+
+translation:
+  # babelebook is supported when its Rust CLI is installed. ollama is the
+  # default native adapter and provides paragraph-level BookFlow caching.
+  engine: ollama
+  babelebook_command: .tools/bin/babel-ebook
+  prompt_version: bookflow-v3-footnotes
+  chunk_size: 1200
+  concurrency: 1
+  # 每次 Ollama 请求失败后的额外重试次数；退避时间按 2x 增长。
+  request_retries: 3
+  retry_backoff_seconds: 2
+  consistency_enabled: true
+  term_extraction_enabled: true
+  chapter_summary_enabled: true
+  context_segments: 2
+  context_chars: 3000
+  term_extraction_chars: 18000
+  parameters:
+    temperature: 0.2
+    top_p: 0.9
+    num_ctx: 8192
+    think: false
+  glossary:
+    Kindle: Kindle
+
+review:
+  enabled: true
+  # 兼容旧配置；新的分级轮数由下面两个字段控制。
+  max_revision_rounds: 2
+  minor_revision_rounds: 2
+  serious_revision_rounds: 5
+  # 默认非严格模式；需要质量门禁时显式设为 true。
+  strict: false
+  # 使用结构化 JSON 输出；格式重试时会自动扩大到最多 8192。
+  # Also used for whole-paragraph revisions; initial translation has its own budget.
+  num_ctx: 16384
+  num_predict: 1024
+
+output:
+  formats: ["epub"]
+  validate_epub: true

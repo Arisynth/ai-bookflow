@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bookflow"
+version = "0.1.0"
+description = "Local, resumable ebook processing and translation pipeline"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+yaml = ["PyYAML>=6.0"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+bookflow = "bookflow.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bookflow*"]
