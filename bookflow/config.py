@@ -120,8 +120,11 @@ class Config:
     minor_revision_rounds: int = 2
     serious_revision_rounds: int = 5
     strict_review: bool = False
-    review_num_ctx: int | None = 4096
-    review_num_predict: int | None = 1024
+    review_num_ctx: int | None = 16384
+    review_num_predict: int | None = 4096
+    review_think: bool | None = False
+    dispute_enabled: bool = True
+    dispute_think: bool | None = None
     temperature: float = 0.2
     top_p: float | None = None
     num_ctx: int | None = None
@@ -134,6 +137,12 @@ class Config:
     context_segments: int = 2
     context_chars: int = 3000
     term_extraction_chars: int = 18000
+    style: dict[str, Any] = field(default_factory=dict)
+    terminology: dict[str, Any] = field(default_factory=dict)
+    chapter_review_enabled: bool = True
+    chapter_review_chars: int = 6000
+    book_revision_rounds: int = 2
+    epubcheck_command: str = "epubcheck"
 
     @classmethod
     def from_mapping(cls, raw: dict[str, Any]) -> "Config":
@@ -173,6 +182,9 @@ class Config:
             strict_review=bool(review.get("strict", cls.strict_review)),
             review_num_ctx=review.get("num_ctx", cls.review_num_ctx),
             review_num_predict=review.get("num_predict", cls.review_num_predict),
+            review_think=review.get("think", cls.review_think),
+            dispute_enabled=bool(review.get("dispute_enabled", cls.dispute_enabled)),
+            dispute_think=review.get("dispute_think", cls.dispute_think),
             temperature=float(params.get("temperature", translation.get("temperature", cls.temperature))),
             top_p=params.get("top_p", translation.get("top_p")),
             num_ctx=params.get("num_ctx", translation.get("num_ctx")),
@@ -185,6 +197,13 @@ class Config:
             context_segments=int(translation.get("context_segments", cls.context_segments)),
             context_chars=int(translation.get("context_chars", cls.context_chars)),
             term_extraction_chars=int(translation.get("term_extraction_chars", cls.term_extraction_chars)),
+            style=({"instructions": translation["style"]} if isinstance(translation.get("style"), str)
+                   else dict(translation.get("style", {}) or {})),
+            terminology=dict(translation.get("terminology", {}) or {}),
+            chapter_review_enabled=bool(review.get("chapter_enabled", cls.chapter_review_enabled)),
+            chapter_review_chars=int(review.get("chapter_chars", cls.chapter_review_chars)),
+            book_revision_rounds=int(review.get("book_revision_rounds", cls.book_revision_rounds)),
+            epubcheck_command=str(output.get("epubcheck_command", cls.epubcheck_command)),
         )
 
     @classmethod
@@ -216,3 +235,18 @@ class Config:
             raise ValueError("review.num_predict must be at least 32")
         if not self.output_formats:
             raise ValueError("output.formats must contain at least epub")
+        if self.context_segments < 0 or self.context_chars < 0:
+            raise ValueError("translation context budgets must be non-negative")
+        if self.term_extraction_chars < 500 or self.chapter_review_chars < 500:
+            raise ValueError("preparation/review character budgets must be at least 500")
+        if self.book_revision_rounds < 0:
+            raise ValueError("review.book_revision_rounds must be non-negative")
+        if not all(isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip()
+                   for k, v in self.glossary.items()):
+            raise ValueError("translation.glossary must map nonempty source strings to target strings")
+        for source, entry in self.terminology.items():
+            if not isinstance(entry, dict) or not isinstance(entry.get("target"), str) or not entry["target"].strip():
+                raise ValueError(f"translation.terminology.{source} requires a target")
+            for key in ("aliases", "allowed_variants"):
+                if key in entry and (not isinstance(entry[key], list) or not all(isinstance(x, str) for x in entry[key])):
+                    raise ValueError(f"terminology {key} must be a list of strings")

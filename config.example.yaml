@@ -41,7 +41,12 @@ translation:
   chapter_summary_enabled: true
   context_segments: 2
   context_chars: 3000
+  # 每个术语扫描批次的上限；实际会按上下文预算缩小，覆盖全书。
   term_extraction_chars: 18000
+  # 留空时由本地模型生成；填写的字段优先于模型判断。
+  style: {}
+  # 可选的详细术语配置（target、aliases、allowed_variants、meaning）。
+  terminology: {}
   parameters:
     temperature: 0.2
     top_p: 0.9
@@ -52,6 +57,10 @@ translation:
 
 review:
   enabled: true
+  chapter_enabled: true
+  chapter_chars: 6000
+  # 段落审校以外的章节问题修订轮数；恢复任务不会无限重跑。
+  book_revision_rounds: 2
   # 兼容旧配置；新的分级轮数由下面两个字段控制。
   max_revision_rounds: 2
   minor_revision_rounds: 2
@@ -61,8 +70,15 @@ review:
   # 使用结构化 JSON 输出；格式重试时会自动扩大到最多 8192。
   # Also used for whole-paragraph revisions; initial translation has its own budget.
   num_ctx: 16384
-  num_predict: 1024
+  # 普通审校保持快速模式；争议再进入推理核验。
+  think: false
+  # 仅在审校提出问题时，用模型默认推理模式再次核验证据。
+  dispute_enabled: true
+  dispute_think: null
+  num_predict: 4096
 
 output:
   formats: ["epub"]
   validate_epub: true
+  # 未安装或留空仍可生成待审稿，但不会标为已定稿。
+  epubcheck_command: epubcheck

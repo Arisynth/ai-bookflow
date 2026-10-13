@@ -28,6 +28,10 @@ def deterministic_qa(segments: list[Segment], translations: dict[str, str]) -> Q
         if not translated:
             issues.append(f"段落无译文: {segment.segment_id}")
             continue
+        original_tokens = re.findall(r"\[\[BOOKFLOW_(?:FOOTNOTE|IMAGE)_\d+\]\]", segment.text)
+        translated_tokens = re.findall(r"\[\[BOOKFLOW_(?:FOOTNOTE|IMAGE)_\d+\]\]", translated)
+        if original_tokens != translated_tokens:
+            issues.append(f"段落 {segment.segment_id} footnote/image 脚注或图片占位符缺失、重复或顺序改变")
         original_numbers = _numeric_values(segment.text)
         translated_numbers = _numeric_values(translated)
         missing = original_numbers - translated_numbers
@@ -36,9 +40,38 @@ def deterministic_qa(segments: list[Segment], translations: dict[str, str]) -> Q
     return QAReport(not issues, len(segments), issues)
 
 
+def numeric_advisories(original: str, translated: str) -> list[str]:
+    """Potential additions need semantic review, not an unconditional veto.
+
+    Chinese idioms, dates, equivalent ratios and bibliography ranges can
+    introduce surface numbers legitimately. Also ask about ownership/units:
+    equal numeric sets cannot prove that numbers describe the same objects.
+    """
+    extra = _numeric_values(translated) - _numeric_values(original)
+    return [f"Verify added/equivalent numbers {sorted(extra)} against source; check units, signs, percentages and which entity each value describes."] if extra else []
+
+
+def numeric_evidence(original: str, translated: str) -> dict[str, object]:
+    """Give reviewers computed quantities with their exact surface evidence."""
+    pattern = (r"(?:[$£€]\s*)?[+-]?\d[\d,]*(?:\.\d+)?\s*"
+               r"(?:trillion|billion|million|thousand|万亿|百万|千万|十亿|亿|万|千)?\s*"
+               r"(?:US dollars?|dollars?|pounds?|euros?|美元|英镑|欧元|%)?")
+    def facts(text: str) -> list[dict[str, object]]:
+        text = re.sub(r"\[\[BOOKFLOW_(?:FOOTNOTE|IMAGE)_\d+\]\]", "", text)
+        result = []
+        for match in re.finditer(pattern, text, re.IGNORECASE):
+            surface = match.group().strip()
+            currency = next((code for code, regex in (("USD", r"\$|dollars?|美元"),
+                            ("GBP", r"£|pounds?|英镑"), ("EUR", r"€|euros?|欧元"))
+                            if re.search(regex, surface, re.IGNORECASE)), None)
+            result.append({"text": surface, "magnitudes": sorted(_numeric_values(surface)), "currency": currency})
+        return result
+    return {"source": facts(original), "translation": facts(translated)}
+
+
 def _numeric_values(text: str) -> set[str]:
     """Normalize explicit scale units: 1.3 billion and 13 亿 have the same value."""
-    text = re.sub(r"\[\[BOOKFLOW_FOOTNOTE_\d+\]\]", "", text)
+    text = re.sub(r"\[\[BOOKFLOW_(?:FOOTNOTE|IMAGE)_\d+\]\]", "", text)
     # Digits in bibliographic URLs are identifiers, not translatable numbers.
     # EPUBs often insert zero-width characters into the source URL, which can
     # otherwise make the same URL look like a different set of numbers.
@@ -50,16 +83,16 @@ def _numeric_values(text: str) -> set[str]:
     scales = {"thousand": 1000, "million": 1000000, "billion": 1000000000,
               "trillion": 1000000000000,
               "千": 1000, "万": 10000, "百万": 1000000, "千万": 10000000,
-              "亿": 100000000, "十亿": 1000000000}
+              "亿": 100000000, "十亿": 1000000000, "万亿": 1000000000000}
     values: set[str] = set()
     compound_pattern = r"(?<![\d.])(?P<number>\d+(?:\.\d+)?)(?:\s*)(?P<scale>万亿美元|亿美元|万英镑)"
     for match in re.finditer(compound_pattern, text):
-        scale = {"万亿美元": 1000000000000, "亿美元": 100000000, "万英镑": 1000000000000}[match["scale"]]
+        scale = {"万亿美元": 1000000000000, "亿美元": 100000000, "万英镑": 10000}[match["scale"]]
         values.add(_number_key(str(Decimal(match["number"]) * scale)))
         # Remove this exact span from the general pass below so that 2万亿
         # is not also interpreted as the unrelated number 2 or 2万.
         text = text.replace(match.group(0), " " * len(match.group(0)), 1)
-    pattern = r"(?<![\d.])(?P<number>\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*(?P<scale>thousand\b|million\b|billion\b|trillion\b|十亿|百万|千万|亿|万|千))?"
+    pattern = r"(?<![\d.])(?P<number>\d+(?:,\d{3})*(?:\.\d+)?)(?:\s*(?P<scale>thousand\b|million\b|billion\b|trillion\b|万亿|十亿|百万|千万|亿|万|千))?"
     for match in re.finditer(pattern, text, flags=re.IGNORECASE):
         value = Decimal(match["number"].replace(",", ""))
         value *= scales.get((match["scale"] or "").lower(), 1)

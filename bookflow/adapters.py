@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .config import Config
 from .errors import ExternalToolError
 from .epub import Segment
+from .memory import semantic_chunks, valid_term_exception, term_occurs
 
 
 def executable_available(command: str) -> bool:
@@ -162,7 +163,20 @@ class OllamaClient:
             "messages": messages,
         }
         if self.options:
-            payload["options"] = self.options
+            payload["options"] = dict(self.options)
+        # Budget the complete prompt before sending it. Never silently slice
+        # book rules or source text. Grow only this request, with a local cap.
+        prompt = system + user
+        non_ascii = sum(ord(char) > 127 for char in prompt)
+        estimate = non_ascii * 2 + (len(prompt) - non_ascii + 2) // 3 + 256
+        output_budget = max(1024, self.options.get("num_predict", 2048))
+        needed = estimate + output_budget
+        configured = int(self.options.get("num_ctx") or 8192)
+        if needed > configured:
+            expanded = ((needed + 1023) // 1024) * 1024
+            if expanded > max(configured, 32768):
+                raise ExternalToolError("完整请求超过本地上下文预算；请减小分段/章节审校批次，未截断或发送正文")
+            payload.setdefault("options", {})["num_ctx"] = expanded
         if self.think is not None:
             payload["think"] = self.think
         if json_format:
@@ -228,15 +242,17 @@ class OllamaTranslator:
             "Return only the COMPLETE corrected translation of the Original, exactly once. "
             "Compare the latest feedback with the actual previous translation and original. "
             "Fix every substantiated remaining error; retain correct prior fixes. Historical feedback "
+            "must not undo a verified correction. Change only wording required by the current substantiated defects; "
+            "do not replace already-correct sentences merely for variety. Historical feedback "
             "is fallible: do not reintroduce resolved errors or follow suggestions that contradict the source. "
             "Do not translate the context or concatenate alternative versions. Never add explanations. "
-            "Preserve numbers, names and every [[BOOKFLOW_FOOTNOTE_N]] placeholder exactly and in order. "
+            "Preserve numbers, names and every [[BOOKFLOW_FOOTNOTE_N]] and [[BOOKFLOW_IMAGE_N]] placeholder exactly and in order. "
             "Use natural target-language punctuation, not source-language grammar rules. "
             "Before returning, silently check that each requested fix appears in the actual output."
         )
         user = (
             f"Book context:\n{context}\n\nGlossary:\n"
-            f"{json.dumps(self.config.glossary, ensure_ascii=False)}\n\n"
+            f"{json.dumps({k: v for k, v in self.config.glossary.items() if term_occurs(k, segment.text)}, ensure_ascii=False)}\n\n"
             f"Initial translation (round 0):\n{initial_translation}\n\n"
             f"Previous candidate translation:\n{previous_translation}\n\n"
             "Complete review feedback history (entry 0 is Initial review (round 0)):\n"
@@ -253,6 +269,10 @@ class OllamaTranslator:
 
     def translate(self, segment: Segment, source_language: str, context: str) -> str:
         text = segment.text
+        if text in self.config.glossary:
+            return self.config.glossary[text]
+        if not re.sub(r"\[\[BOOKFLOW_(?:FOOTNOTE|IMAGE)_\d+\]\]", "", text).strip():
+            return text
         # Short structural headings are not useful language-model work and
         # can cause small translation models to continue with unrelated text.
         # Normalize the common English book heading form deterministically so
@@ -260,8 +280,8 @@ class OllamaTranslator:
         heading = re.fullmatch(r"\s*Chapter\s+(\d+)\s*", text, flags=re.IGNORECASE)
         if heading and source_language == "en" and self.config.target_language.lower() in {"zh-cn", "zh-hans"}:
             return f"第{heading.group(1)}章"
-        chunks = [text[i : i + self.config.chunk_size] for i in range(0, len(text), self.config.chunk_size)]
-        glossary = "；".join(f"{k}={v}" for k, v in self.config.glossary.items()) or "无"
+        chunks = semantic_chunks(text, self.config.chunk_size)
+        glossary = "；".join(f"{k}={v}" for k, v in self.config.glossary.items() if term_occurs(k, text)) or "无"
         language_name = {"en": "English", "de": "German", "fr": "French", "es": "Spanish"}.get(source_language, source_language)
         translated: list[str] = []
         for chunk in chunks:
@@ -275,33 +295,29 @@ class OllamaTranslator:
                     f"You are a professional {language_name} ({source_language}) to Simplified Chinese (zh-Hans) translator. "
                     "Your goal is to accurately convey the meaning and nuances of the original text while adhering to Simplified Chinese grammar, vocabulary, and cultural sensitivities. "
                     "Produce only the Simplified Chinese translation, without any additional explanations or commentary. "
+                    f"Mandatory book policy and context (do not translate):\n{context}\nGlossary: {glossary}\n"
                     f"Please translate the following {source_language} text into Simplified Chinese:\n\n\n{chunk}"
                 )
             else:
-                if "Reviewer feedback history:" in context:
-                    # Revision prompts must retain the complete feedback
-                    # history. Normal translation context remains bounded,
-                    # while review feedback is intentionally allowed more
-                    # room so earlier corrections are not lost.
-                    context_for_prompt = context[:7000]
-                else:
-                    context_for_prompt = context[:1500]
+                context_for_prompt = context
                 system = (
-                    "You are a careful literary translator. Translate faithfully without summarizing, adding, or omitting. "
+                    "You are a careful book translator. Follow the supplied book style and terminology. "
+                    "Translate faithfully without summarizing, adding, or omitting. "
                     f"Translate from {source_language} to {self.config.target_language}. Preserve numbers, names, punctuation, "
                     "and paragraph meaning. Return only the translation."
                 )
                 user = (
                     f"Book context:\n{context_for_prompt}\n\nGlossary:\n{glossary}\n\n"
-                    f"Paragraph to translate:\n{chunk}"
+                    + (f"Previous translated part of THIS paragraph (continuity only):\n{translated[-1][-1000:]}\n\n" if translated else "")
+                    + f"Paragraph to translate:\n{chunk}"
                 )
-            if "[[BOOKFLOW_FOOTNOTE_" in chunk:
+            if "[[BOOKFLOW_" in chunk:
                 instruction = (
-                    " Preserve every [[BOOKFLOW_FOOTNOTE_N]] placeholder exactly, including its spelling and relative position; "
+                    " Preserve every [[BOOKFLOW_FOOTNOTE_N]] and [[BOOKFLOW_IMAGE_N]] placeholder exactly, including its spelling and relative position; "
                     "do not translate, renumber, remove, or explain these placeholders."
                 )
                 system += instruction
-                user += "\n\nFootnote placeholder rule: keep every [[BOOKFLOW_FOOTNOTE_N]] exactly as written."
+                user += "\n\nFootnote placeholder rule: keep every [[BOOKFLOW_FOOTNOTE_N]] and [[BOOKFLOW_IMAGE_N]] exactly as written."
             if self.client.model.lower().startswith("translategemma"):
                 result = self.client.chat(system, user)
                 # TranslateGemma can occasionally copy an English adjective
@@ -322,17 +338,18 @@ class OllamaTranslator:
                     )
                     if hint_lines:
                         repair += " Use these required translations: " + "; ".join(hint_lines) + "."
-                    repair += f" Please translate the following {source_language} text into Simplified Chinese:\n\n\n{chunk}"
+                    repair += f" Mandatory book policy and glossary:\n{context}\n{glossary}\nPlease translate the following {source_language} text into Simplified Chinese:\n\n\n{chunk}"
                     result = self.client.chat("", repair)
                 translated.append(result)
             else:
                 translated.append(self.client.chat(system, user))
-        return "".join(translated).strip()
+        return ("" if self.config.target_language.lower().startswith("zh") else " ").join(translated).strip()
 
 
 class OllamaReviewer:
-    def __init__(self, client: OllamaClient, *, max_parse_retries: int = 2):
+    def __init__(self, client: OllamaClient, *, max_parse_retries: int = 2, verifier: Any = None):
         self.client = client
+        self.verifier = verifier
         # Transport retries are handled by OllamaClient. These retries are
         # separate: the request succeeded, but the model violated the review
         # response contract (for example, truncated JSON or a code fence).
@@ -341,7 +358,7 @@ class OllamaReviewer:
     def review(self, original: str, translated: str, context: str, *,
                _allegations: dict[str, Any] | None = None) -> dict[str, Any]:
         system = (
-            "You review a translation concisely. Return only one complete JSON object with exactly four keys: "
+            "You review a translation concisely. Return only one complete JSON object with four required keys: "
             "ok (boolean), severity (string), issues (array of short strings), and suggestion (string). "
             "severity must be one of none, minor, major, or critical. Use none only when ok=true. "
             "Use minor for typography, punctuation, stylistic, or low-impact terminology issues; "
@@ -357,6 +374,12 @@ class OllamaReviewer:
             "suggestion must be a concise, actionable correction plan that addresses every issue, "
             "but must not be a rewritten paragraph. If ok=true, suggestion must be empty. "
             "Do not write analysis, Markdown fences, or any text outside the JSON."
+            " The supplied book style and locked terminology apply to review and revision alike. "
+            "Use adjacent SOURCE paragraphs to resolve references and meaning; never judge just an isolated phrase. "
+            "Check number ownership, signs, units, percentages, negation, omissions and additions, not only digit presence. "
+            "Optional terminology_exceptions may map an AUTOMATIC term to {kind: different_sense or bibliography, "
+            "source_quote: exact original evidence, reason: precise justification}. Never waive a human term rule "
+            "or use generic synonym preference as an exception. Do not repeat resolved allegations."
         )
         user = f"Context:\n{context}\n\nOriginal:\n{original}\n\nTranslation:\n{translated}"
         if _allegations is not None:
@@ -383,6 +406,10 @@ class OllamaReviewer:
                     "maxItems": 3,
                 },
                 "suggestion": {"type": "string", "maxLength": 800},
+                "terminology_exceptions": {"type": "object", "additionalProperties": {
+                    "type": "object", "properties": {"kind": {"type": "string", "enum": ["different_sense", "bibliography"]},
+                    "source_quote": {"type": "string"}, "reason": {"type": "string"}},
+                    "required": ["kind", "source_quote", "reason"], "additionalProperties": False}},
             },
             "required": ["ok", "severity", "issues", "suggestion"],
             "additionalProperties": False,
@@ -445,8 +472,21 @@ class OllamaReviewer:
                 # generating a second full translation in the review call.
                 "suggestion": (suggestion or "；".join(value["issues"])) if not value["ok"] else "",
             }
+            exceptions = value.get("terminology_exceptions", {})
+            if exceptions and isinstance(exceptions, dict):
+                result["terminology_exceptions"] = {k: v for k, v in exceptions.items()
+                                                    if valid_term_exception(v, original)}
             if not result["ok"] and _allegations is None:
-                confirmed = self.review(original, translated, context, _allegations=result)
+                try:
+                    confirmed = (self.verifier or self).review(original, translated, context, _allegations=result)
+                except ExternalToolError as exc:
+                    if not self.verifier:
+                        raise
+                    # An unavailable reasoning mode is not a required manual
+                    # configuration step. Fall back to the ordinary evidence
+                    # verifier, and preserve the failure in the audit record.
+                    confirmed = self.review(original, translated, context, _allegations=result)
+                    confirmed["verification_error"] = str(exc)
                 confirmed["preliminary_review"] = result
                 return confirmed
             return result

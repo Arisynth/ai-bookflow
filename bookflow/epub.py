@@ -7,7 +7,7 @@ import posixpath
 import re
 import zipfile
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -24,7 +24,7 @@ ET.register_namespace("", XHTML_NS)
 ET.register_namespace("opf", OPF_NS)
 ET.register_namespace("dc", DC_NS)
 
-BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption", "td", "th"}
+BLOCK_TAGS = {"p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote", "figcaption", "caption", "dt", "dd", "td", "th"}
 SKIP_TAGS = {"script", "style", "code", "pre", "svg"}
 FOOTNOTE_FRAGMENT_RE = re.compile(r"(?:^|[-_])nts\d+[a-z]?$", re.IGNORECASE)
 FOOTNOTE_TOKEN_TEMPLATE = "[[BOOKFLOW_FOOTNOTE_{}]]"
@@ -60,6 +60,11 @@ def _footnote_refs(element: ET.Element) -> list[tuple[str, ET.Element]]:
     for child in element.iter():
         if _is_footnote_anchor(child):
             refs.append((FOOTNOTE_TOKEN_TEMPLATE.format(len(refs) + 1), child))
+    image_number = 0
+    for child in element.iter():
+        if local_name(child.tag) == "img":
+            image_number += 1
+            refs.append((f"[[BOOKFLOW_IMAGE_{image_number}]]", child))
     return refs
 
 
@@ -85,7 +90,53 @@ def _segment_text(element: ET.Element) -> str:
 
 
 def has_block_descendant(element: ET.Element) -> bool:
-    return any(local_name(child.tag) in BLOCK_TAGS for child in list(element.iter())[1:])
+    return any(local_name(child.tag) in BLOCK_TAGS or "bookflow-source-run" in child.get("class", "").split()
+               for child in list(element.iter())[1:])
+
+
+def _prepare_text_blocks(root: ET.Element) -> None:
+    """Expose loose/mixed container text without flattening nested paragraphs.
+
+    The same deterministic normalization runs for inspection and rebuilding,
+    so stable IDs describe precisely the text that is replaced in the output.
+    """
+    containers = {"body", "div", "section", "article", "aside", "header", "footer", "main", "nav", "figure"}
+    for node in list(root.iter())[::-1]:
+        tag = local_name(node.tag)
+        if tag not in containers and not (tag in BLOCK_TAGS and has_block_descendant(node)):
+            continue
+        children = list(node)
+        if not (node.text and node.text.strip()) and all(
+                (local_name(child.tag) in BLOCK_TAGS | containers | SKIP_TAGS or "bookflow-source-run" in child.get("class", "").split()) and not (child.tail and child.tail.strip())
+                for child in children):
+            continue
+        leading = node.text
+        node.text = None
+        for child in children:
+            node.remove(child)
+        run = ET.Element(f"{{{XHTML_NS}}}span", {"class": "bookflow-source-run"})
+        run.text = leading
+
+        def flush() -> None:
+            nonlocal run
+            if run.text or len(run):
+                node.append(run)
+            run = ET.Element(f"{{{XHTML_NS}}}span", {"class": "bookflow-source-run"})
+
+        for child in children:
+            if local_name(child.tag) in BLOCK_TAGS | containers | SKIP_TAGS or has_block_descendant(child) or "bookflow-source-run" in child.get("class", "").split():
+                flush()
+                tail = child.tail
+                child.tail = None
+                node.append(child)
+                run.text = tail
+            else:
+                run.append(child)
+        flush()
+
+
+def _translatable(element: ET.Element) -> bool:
+    return (local_name(element.tag) in BLOCK_TAGS or "bookflow-source-run" in element.get("class", "").split()) and not has_block_descendant(element)
 
 
 @dataclass
@@ -104,6 +155,7 @@ class EpubBook:
     spine_files: list[str]
     title: str
     segments: list[Segment]
+    legacy_ids: dict[str, str] = field(default_factory=dict)
 
 
 def _read_xml(zf: zipfile.ZipFile, name: str) -> ET.Element:
@@ -135,6 +187,8 @@ def _opf_details(zf: zipfile.ZipFile) -> tuple[str, str, list[str]]:
         href = manifest.get(itemref.attrib.get("idref", ""))
         if href:
             spine_files.append(href)
+        else:
+            raise BookFlowError("EPUB spine 引用了不存在的 manifest 条目")
     title = ""
     title_el = opf.find(f".//{{{DC_NS}}}title")
     if title_el is not None and title_el.text:
@@ -154,26 +208,43 @@ def inspect_epub(path: Path) -> EpubBook:
         opf_path, title, spine_files = _opf_details(zf)
         segments: list[Segment] = []
         ordinal = 0
+        legacy_ordinal = 0
+        legacy_ids = {}
+        legacy_tags = BLOCK_TAGS - {"caption", "dt", "dd"}
         for chapter_index, file_name in enumerate(spine_files, start=1):
             try:
                 root = ET.fromstring(zf.read(file_name))
             except KeyError:
-                continue
+                raise BookFlowError(f"EPUB spine 指向缺失的章节: {file_name}")
             except ET.ParseError as exc:
                 raise BookFlowError(f"章节 XML 损坏: {file_name}: {exc}") from exc
+            old_ids = {}
+            for node in root.iter():
+                if local_name(node.tag) not in legacy_tags or any(local_name(c.tag) in legacy_tags for c in list(node.iter())[1:]):
+                    continue
+                old_text = re.sub(r"\[\[BOOKFLOW_IMAGE_\d+\]\]", "", _segment_text(node))
+                old_text = re.sub(r"\s+", " ", old_text).strip()
+                if len(old_text) < 2:
+                    continue
+                legacy_ordinal += 1
+                old_ids[id(node)] = hashlib.sha256(f"{file_name}\0{legacy_ordinal}\0{old_text}".encode()).hexdigest()[:20]
+            _prepare_text_blocks(root)
+            skipped = {id(child) for node in root.iter() if local_name(node.tag) in SKIP_TAGS for child in node.iter()}
             for element in root.iter():
                 tag = local_name(element.tag)
-                if tag not in BLOCK_TAGS or tag in SKIP_TAGS or has_block_descendant(element):
+                if not _translatable(element) or id(element) in skipped:
                     continue
                 text = _segment_text(element)
-                if len(text) < 2:
+                if not text:
                     continue
                 ordinal += 1
                 segment_id = hashlib.sha256(f"{file_name}\0{ordinal}\0{text}".encode()).hexdigest()[:20]
+                if id(element) in old_ids:
+                    legacy_ids[segment_id] = old_ids[id(element)]
                 segments.append(Segment(segment_id, f"chapter-{chapter_index}", text, file_name, ordinal))
     if not spine_files:
         raise BookFlowError("EPUB 没有可处理的 spine 章节")
-    return EpubBook(path, opf_path, spine_files, title, segments)
+    return EpubBook(path, opf_path, spine_files, title, segments, legacy_ids)
 
 
 def book_text(book: EpubBook) -> str:
@@ -247,6 +318,8 @@ def build_translated_epub(
             data = zin.read(info.filename)
             if info.filename in book.spine_files:
                 root = ET.fromstring(data)
+                _prepare_text_blocks(root)
+                skipped = {id(child) for node in root.iter() if local_name(node.tag) in SKIP_TAGS for child in node.iter()}
                 parents = {child: parent for parent in root.iter() for child in list(parent)}
                 elements = list(root.iter())
                 local_ordinal = 0
@@ -254,10 +327,10 @@ def build_translated_epub(
                     if "bookflow-translation" in element.attrib.get("class", "").split():
                         continue
                     tag = local_name(element.tag)
-                    if tag not in BLOCK_TAGS or tag in SKIP_TAGS or has_block_descendant(element):
+                    if not _translatable(element) or id(element) in skipped:
                         continue
                     text = _segment_text(element)
-                    if len(text) < 2:
+                    if not text:
                         continue
                     local_ordinal += 1
                     ordinal = file_offsets.get(info.filename, 0) + local_ordinal
@@ -382,7 +455,7 @@ def markdown_to_epub(markdown_path: Path, destination: Path, title: str | None =
             paragraph.append(value)
     flush()
     if not blocks:
-        blocks = ["<p>Marker 未提取到可读文本，请检查 OCR/版面结果。</p>"]
+        raise BookFlowError("Marker 未提取到可读文本，请检查 OCR/版面结果")
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     toc_html = _render_toc(toc_entries, markdown_path.parent, image_assets, available_page_anchors) if toc_entries else ""

@@ -56,6 +56,10 @@ class FakeOllamaClient:
         type(self).calls += 1
         if self.fail_on_call and self.calls == self.fail_on_call:
             raise BookFlowError("simulated interruption")
+        if '"terms":[' in user:
+            return '{"terms": [], "summary": "Source passage facts."}'
+        if '"style":{' in user:
+            return '{"style":{"genre":"nonfiction","audience":"general","tone":"clear","rules":"faithful"}}'
         original = user.split("Paragraph to translate:\n", 1)[-1]
         return f"译文：{original}"
 
@@ -80,6 +84,7 @@ class BookFlowTests(unittest.TestCase):
             review_enabled=False,
             output_formats=["epub"],
             consistency_enabled=False,
+            epubcheck_command="",
         )
         values.update(kwargs)
         return Config(**values)
@@ -248,6 +253,10 @@ class BookFlowTests(unittest.TestCase):
                 self.model = _args[1] if len(_args) > 1 else "test-model"
 
             def chat(self, _system, user, **kwargs):
+                if '"terms":[' in user:
+                    return '{"terms": [], "summary": "Source passage facts."}'
+                if '"style":{' in user:
+                    return '{"style":{"genre":"nonfiction","audience":"general","tone":"clear","rules":"faithful"}}'
                 if "json_format" in kwargs:
                     if "Original:\nThe first chapter" in user and "修订译文" not in user:
                         return '{"ok": false, "issues": ["需要修订措辞"]}'
@@ -262,12 +271,13 @@ class BookFlowTests(unittest.TestCase):
                 prefix = "修订译文：" if "Current correction request" in user else "译文："
                 return prefix + source
 
-        with patch("bookflow.pipeline.OllamaClient", ReviewLoopClient):
+        with patch("bookflow.pipeline.OllamaClient", ReviewLoopClient), patch("bookflow.pipeline.Pipeline._validate_artifact"):
             state = Pipeline(
                 self.config(
                     review_enabled=True,
                     review_model="reviewer",
                     max_revision_rounds=2,
+                    consistency_enabled=True,
                     strict_review=True,
                 )
             ).start(self.input)

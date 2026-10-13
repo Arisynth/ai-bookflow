@@ -100,7 +100,8 @@ def main(argv: list[str] | None = None) -> int:
                 print(quality.read_text(encoding="utf-8"))
         elif args.command == "doctor":
             checks = {name: shutil.which(value) or False for name, value in {
-                "ollama": "ollama", "marker": config.marker_command, "calibre": config.calibre_command, "babelebook": config.babelebook_command
+                "ollama": "ollama", "marker": config.marker_command, "calibre": config.calibre_command, "babelebook": config.babelebook_command,
+                "epubcheck": config.epubcheck_command
             }.items()}
             print(json.dumps({"platform": sys.platform, "checks": checks}, ensure_ascii=False, indent=2))
         return 0

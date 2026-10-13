@@ -189,8 +189,10 @@ class RevisionTests(unittest.TestCase):
                 return {"selected_index": 0, "reason": "good"}
 
         with TemporaryDirectory() as directory:
-            result = self.run_review(Path(directory), Reviewer(), object(), rounds=0,
-                                     text="Source [[BOOKFLOW_FOOTNOTE_1]]")
+            with self.assertRaisesRegex(Exception, "footnote"):
+                self.run_review(Path(directory), Reviewer(), object(), rounds=0,
+                                text="Source [[BOOKFLOW_FOOTNOTE_1]]")
+            result = json.loads((Path(directory) / "reviews/review_checkpoint.json").read_text())["llm"][0]
             self.assertFalse(result["ok"])
             self.assertIn("footnote", result["issues"][-1])
 
